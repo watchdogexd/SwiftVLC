@@ -1482,14 +1482,14 @@ with open(path, 'r') as f:
 # (after "codec_PLUGINS += libavcodec_plugin.la" and its endif)
 marker = '''if HAVE_AVCODEC
 noinst_LTLIBRARIES += libavcodec_common.la
-codec_PLUGINS += libavcodec_plugin.la
+codec_LTLIBRARIES += libavcodec_plugin.la
 endif
 
 ### avcodec hardware acceleration ###'''
 
 vt_va_block = '''if HAVE_AVCODEC
 noinst_LTLIBRARIES += libavcodec_common.la
-codec_PLUGINS += libavcodec_plugin.la
+codec_LTLIBRARIES += libavcodec_plugin.la
 endif
 
 ### avcodec VideoToolbox VA (FFmpeg hwaccel → CVPX) ###
@@ -1502,7 +1502,7 @@ libvt_avcodec_va_plugin_la_LDFLAGS = $(AM_LDFLAGS) -Wl,-framework,VideoToolbox -
 if HAVE_AVCODEC
 if HAVE_DARWIN
 if !HAVE_WATCHOS
-codec_PLUGINS += libvt_avcodec_va_plugin.la
+codec_LTLIBRARIES += libvt_avcodec_va_plugin.la
 endif
 endif
 endif

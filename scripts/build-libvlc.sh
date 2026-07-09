@@ -1077,6 +1077,465 @@ PYEOF
 
 patch_vlc_disable_rust
 
+# --- Step 1h: Enable FFmpeg VideoToolbox hwaccel for AV1 ---
+# FFmpeg's videotoolbox_av1.o is compiled into the binary (via contrib FFmpeg),
+# but VLC's avcodec module never negotiates AV_PIX_FMT_VIDEOTOOLBOX — so the
+# hwaccel is dead code. Three changes wire it up:
+#   1. video.c: add AV_PIX_FMT_VIDEOTOOLBOX to the hwfmts[] array
+#   2. va.c: accept AV_PIX_FMT_VIDEOTOOLBOX in vlc_va_MightDecode()
+#   3. va_videotoolbox.c: new VA module bridging FFmpeg VT → VLC CVPX pipeline
+#   4. Makefile.am: build + register the new VA module plugin
+#
+# On devices with VT AV1 hardware (A17 Pro / M3 and newer), FFmpeg's hwaccel
+# routes decoding through VideoToolbox, producing CVPixelBuffer-backed frames
+# that flow through VLC's existing CVPX output path. On older devices, the
+# avcodec hw probe fails gracefully and falls through to dav1d (priority 10000,
+# one below the hw path's 10001).
+#
+# The native VLC VideoToolbox module (modules/codec/videotoolbox/) only handles
+# H.264 and HEVC — no conflict, it never probes for AV1.
+patch_vlc_avcodec_vt() {
+    local VIDEO_C="${VLC_SRC}/modules/codec/avcodec/video.c"
+    local VA_C="${VLC_SRC}/modules/codec/avcodec/va.c"
+    local VA_VT_C="${VLC_SRC}/modules/codec/avcodec/va_videotoolbox.c"
+    local MAKEFILE_AM="${VLC_SRC}/modules/codec/Makefile.am"
+
+    if [ -f "$VA_VT_C" ]; then
+        info "VLC avcodec VideoToolbox VA module already patched"
+        return 0
+    fi
+
+    info "Patching VLC avcodec module for VideoToolbox hwaccel (AV1)..."
+
+    # --- Patch 1: video.c — add AV_PIX_FMT_VIDEOTOOLBOX to hwfmts[] ---
+    python3 - "$VIDEO_C" << 'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+old = '''static const enum AVPixelFormat hwfmts[] =
+{
+#ifdef _WIN32
+    AV_PIX_FMT_D3D11VA_VLD,
+    AV_PIX_FMT_DXVA2_VLD,
+#endif
+    AV_PIX_FMT_VAAPI,
+    AV_PIX_FMT_VDPAU,
+    AV_PIX_FMT_NONE,
+};'''
+
+new = '''static const enum AVPixelFormat hwfmts[] =
+{
+#ifdef _WIN32
+    AV_PIX_FMT_D3D11VA_VLD,
+    AV_PIX_FMT_DXVA2_VLD,
+#endif
+#ifdef __APPLE__
+    AV_PIX_FMT_VIDEOTOOLBOX,
+#endif
+    AV_PIX_FMT_VAAPI,
+    AV_PIX_FMT_VDPAU,
+    AV_PIX_FMT_NONE,
+};'''
+
+if old not in content:
+    raise SystemExit('hwfmts[] array not found in video.c — VLC source shape changed')
+
+content = content.replace(old, new, 1)
+
+with open(path, 'w') as f:
+    f.write(content)
+
+print('video.c: AV_PIX_FMT_VIDEOTOOLBOX added to hwfmts[]')
+PYEOF
+
+    # --- Patch 2: va.c — accept AV_PIX_FMT_VIDEOTOOLBOX in vlc_va_MightDecode ---
+    python3 - "$VA_C" << 'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+old = '''    switch (hwfmt)
+    {
+        case AV_PIX_FMT_VAAPI:
+        case AV_PIX_FMT_DXVA2_VLD:
+        case AV_PIX_FMT_D3D11VA_VLD:
+        case AV_PIX_FMT_VDPAU:
+            return true;'''
+
+new = '''    switch (hwfmt)
+    {
+        case AV_PIX_FMT_VAAPI:
+        case AV_PIX_FMT_DXVA2_VLD:
+        case AV_PIX_FMT_D3D11VA_VLD:
+        case AV_PIX_FMT_VDPAU:
+#ifdef __APPLE__
+        case AV_PIX_FMT_VIDEOTOOLBOX:
+#endif
+            return true;'''
+
+if old not in content:
+    raise SystemExit('vlc_va_MightDecode switch not found in va.c — VLC source shape changed')
+
+content = content.replace(old, new, 1)
+
+with open(path, 'w') as f:
+    f.write(content)
+
+print('va.c: AV_PIX_FMT_VIDEOTOOLBOX accepted in vlc_va_MightDecode()')
+PYEOF
+
+    # --- Patch 3: Write new va_videotoolbox.c ---
+    cat > "$VA_VT_C" << 'CEOF'
+/*****************************************************************************
+ * va_videotoolbox.c: VideoToolbox VA module for the libavcodec decoder
+ *****************************************************************************
+ * Copyright (C) 2024 SwiftVLC contributors
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation; either version 2.1 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
+ *****************************************************************************/
+
+/**
+ * Bridges FFmpeg's VideoToolbox hwaccel (AV_PIX_FMT_VIDEOTOOLBOX) into VLC's
+ * VA module interface. This lets FFmpeg's compiled-in videotoolbox_av1.o (and
+ * any future VT hwaccels) produce CVPixelBuffer-backed frames that flow
+ * through VLC's CVPX pipeline — the same pipeline the native VT decoder uses.
+ *
+ * The native VLC VideoToolbox module (modules/codec/videotoolbox/) only
+ * handles H.264 and HEVC. This module covers everything FFmpeg's VT hwaccel
+ * supports — currently AV1 on A17 Pro / M3 and newer.
+ */
+
+#ifdef HAVE_CONFIG_H
+# include "config.h"
+#endif
+
+#include <assert.h>
+
+#include <vlc_common.h>
+#include <vlc_plugin.h>
+#include <vlc_fourcc.h>
+#include <vlc_picture.h>
+
+#include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_videotoolbox.h>
+
+#include "avcodec.h"
+#include "va.h"
+#include "../vt_utils.h"
+
+struct vt_va_ctx
+{
+    AVBufferRef *hwframes_ref;
+};
+
+/**
+ * Picture context layout-compatible with cvpxpic_ctx (vt_utils.c):
+ * the first field after picture_context_t must be a CVPixelBufferRef
+ * so that cvpxpic_get_ref() — which casts blindly — reads the right
+ * pointer. We append an AVFrame ref to keep the VT surface alive.
+ */
+typedef struct {
+    picture_context_t s;
+    CVPixelBufferRef  cvpx;       /* MUST be first after s — cvpxpic_get_ref layout */
+    unsigned          nb_fields;  /* mirror cvpxpic_ctx layout */
+    AVFrame          *avframe;
+} vt_dec_pic_context;
+
+static void vt_dec_pic_context_destroy(picture_context_t *context)
+{
+    vt_dec_pic_context *pic_ctx = (vt_dec_pic_context *)context;
+    CFRelease(pic_ctx->cvpx);
+    av_frame_free(&pic_ctx->avframe);
+    vlc_video_context_Release(pic_ctx->s.vctx);
+    free(pic_ctx);
+}
+
+static picture_context_t *vt_dec_pic_context_copy(picture_context_t *src)
+{
+    vt_dec_pic_context *src_ctx = (vt_dec_pic_context *)src;
+    vt_dec_pic_context *pic_ctx = malloc(sizeof(*pic_ctx));
+    if (unlikely(pic_ctx == NULL))
+        return NULL;
+
+    *pic_ctx = *src_ctx;
+    CVPixelBufferRetain(pic_ctx->cvpx);
+    pic_ctx->avframe = av_frame_clone(src_ctx->avframe);
+    if (!pic_ctx->avframe)
+    {
+        CFRelease(pic_ctx->cvpx);
+        free(pic_ctx);
+        return NULL;
+    }
+    vlc_video_context_Hold(pic_ctx->s.vctx);
+    return &pic_ctx->s;
+}
+
+static int Get(vlc_va_t *va, picture_t *pic, AVCodecContext *ctx, AVFrame *frame)
+{
+    vlc_video_context *vctx = va->sys;
+
+    int ret = av_hwframe_get_buffer(ctx->hw_frames_ctx, frame, 0);
+    if (ret < 0)
+    {
+        msg_Err(va, "av_hwframe_get_buffer failed: %d", ret);
+        return VLC_EGENERIC;
+    }
+
+    CVPixelBufferRef cvpx = (CVPixelBufferRef)frame->data[3];
+    if (cvpx == NULL)
+    {
+        msg_Err(va, "VideoToolbox frame has no CVPixelBuffer");
+        av_frame_unref(frame);
+        return VLC_EGENERIC;
+    }
+
+    vt_dec_pic_context *pctx = malloc(sizeof(*pctx));
+    if (unlikely(pctx == NULL))
+    {
+        av_frame_unref(frame);
+        return VLC_ENOMEM;
+    }
+
+    pctx->s = (picture_context_t) {
+        vt_dec_pic_context_destroy, vt_dec_pic_context_copy, vctx,
+    };
+    pctx->cvpx = CVPixelBufferRetain(cvpx);
+    pctx->nb_fields = pic->i_nb_fields;
+    pctx->avframe = av_frame_clone(frame);
+#if LIBAVCODEC_VERSION_CHECK(61, 03, 100)
+    av_frame_side_data_free(&pctx->avframe->side_data,
+                            &pctx->avframe->nb_side_data);
+#endif
+    av_buffer_unref(&pctx->avframe->opaque_ref);
+    pctx->avframe->opaque = NULL;
+    vlc_video_context_Hold(vctx);
+    pic->context = &pctx->s;
+
+    return VLC_SUCCESS;
+}
+
+static void Delete(vlc_va_t *va, AVCodecContext *ctx)
+{
+    if (ctx)
+        av_buffer_unref(&ctx->hw_frames_ctx);
+    vlc_video_context_Release(va->sys);
+}
+
+static void vt_ctx_destroy(void *priv)
+{
+    struct vt_va_ctx *vt_ctx = priv;
+    av_buffer_unref(&vt_ctx->hwframes_ref);
+}
+
+static const struct vlc_va_operations ops =
+{
+    .get = Get,
+    .close = Delete,
+};
+
+static const struct vlc_video_context_operations vt_ctx_ops =
+{
+    .destroy = vt_ctx_destroy,
+};
+
+static int Create(vlc_va_t *va, struct vlc_va_cfg *cfg)
+{
+    AVCodecContext *ctx = cfg->avctx;
+
+    if (cfg->hwfmt != AV_PIX_FMT_VIDEOTOOLBOX)
+        return VLC_EGENERIC;
+    if (cfg->dec_device == NULL ||
+        cfg->dec_device->type != VLC_DECODER_DEVICE_VIDEOTOOLBOX)
+        return VLC_EGENERIC;
+
+    AVBufferRef *hwdev_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
+    if (hwdev_ref == NULL)
+        return VLC_EGENERIC;
+
+    if (av_hwdevice_ctx_init(hwdev_ref) < 0)
+    {
+        av_buffer_unref(&hwdev_ref);
+        return VLC_EGENERIC;
+    }
+
+    AVBufferRef *hwframes_ref;
+    int ret = avcodec_get_hw_frames_parameters(ctx, hwdev_ref,
+                                               AV_PIX_FMT_VIDEOTOOLBOX,
+                                               &hwframes_ref);
+    av_buffer_unref(&hwdev_ref);
+    if (ret < 0)
+    {
+        msg_Err(va, "avcodec_get_hw_frames_parameters failed: %d", ret);
+        return VLC_EGENERIC;
+    }
+
+    AVHWFramesContext *hwframes_ctx = (AVHWFramesContext *)hwframes_ref->data;
+
+    if (hwframes_ctx->initial_pool_size)
+        hwframes_ctx->initial_pool_size += 3;
+
+    ret = av_hwframe_ctx_init(hwframes_ref);
+    if (ret < 0)
+    {
+        msg_Err(va, "av_hwframe_ctx_init failed: %d", ret);
+        av_buffer_unref(&hwframes_ref);
+        return VLC_EGENERIC;
+    }
+
+    vlc_fourcc_t vlc_chroma;
+    switch (hwframes_ctx->sw_format)
+    {
+        case AV_PIX_FMT_NV12:
+        case AV_PIX_FMT_YUV420P:
+            vlc_chroma = VLC_CODEC_CVPX_NV12;
+            break;
+        case AV_PIX_FMT_P010LE:
+        case AV_PIX_FMT_P010BE:
+        case AV_PIX_FMT_YUV420P10LE:
+        case AV_PIX_FMT_YUV420P10BE:
+            vlc_chroma = VLC_CODEC_CVPX_P010;
+            break;
+        case AV_PIX_FMT_BGRA:
+            vlc_chroma = VLC_CODEC_CVPX_BGRA;
+            break;
+        case AV_PIX_FMT_UYVY422:
+            vlc_chroma = VLC_CODEC_CVPX_UYVY;
+            break;
+        default:
+            msg_Warn(va, "unsupported VT sw_format: %s",
+                     av_get_pix_fmt_name(hwframes_ctx->sw_format));
+            av_buffer_unref(&hwframes_ref);
+            return VLC_EGENERIC;
+    }
+
+    ctx->hw_frames_ctx = av_buffer_ref(hwframes_ref);
+    if (!ctx->hw_frames_ctx)
+    {
+        av_buffer_unref(&hwframes_ref);
+        return VLC_EGENERIC;
+    }
+
+    vlc_video_context *vctx =
+        vlc_video_context_CreateCVPX(cfg->dec_device,
+                                     CVPX_VIDEO_CONTEXT_DEFAULT,
+                                     sizeof(struct vt_va_ctx),
+                                     &vt_ctx_ops);
+    if (vctx == NULL)
+    {
+        av_buffer_unref(&hwframes_ref);
+        av_buffer_unref(&ctx->hw_frames_ctx);
+        return VLC_EGENERIC;
+    }
+
+    struct vt_va_ctx *vt_ctx =
+        vlc_video_context_GetCVPXPrivate(vctx, CVPX_VIDEO_CONTEXT_DEFAULT);
+    vt_ctx->hwframes_ref = hwframes_ref;
+
+    msg_Info(va, "Using FFmpeg VideoToolbox hwaccel (sw_format=%s)",
+             av_get_pix_fmt_name(hwframes_ctx->sw_format));
+
+    cfg->video_fmt_out->i_chroma = vlc_chroma;
+    cfg->vctx_out = vctx;
+    cfg->use_hwframes = true;
+    cfg->extra_pictures = 8;
+
+    va->ops = &ops;
+    va->sys = vctx;
+    return VLC_SUCCESS;
+}
+
+vlc_module_begin()
+    set_description(N_("FFmpeg VideoToolbox video decoder"))
+    set_va_callback(Create, 100)
+    add_shortcut("videotoolbox-avcodec")
+    set_subcategory(SUBCAT_INPUT_VCODEC)
+vlc_module_end()
+CEOF
+
+    # --- Patch 4: Makefile.am — register the VT VA plugin ---
+    python3 - "$MAKEFILE_AM" << 'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+# Insert the VT VA plugin block right after the avcodec plugin section
+# (after "codec_PLUGINS += libavcodec_plugin.la" and its endif)
+marker = '''if HAVE_AVCODEC
+noinst_LTLIBRARIES += libavcodec_common.la
+codec_PLUGINS += libavcodec_plugin.la
+endif
+
+### avcodec hardware acceleration ###'''
+
+vt_va_block = '''if HAVE_AVCODEC
+noinst_LTLIBRARIES += libavcodec_common.la
+codec_PLUGINS += libavcodec_plugin.la
+endif
+
+### avcodec VideoToolbox VA (FFmpeg hwaccel → CVPX) ###
+
+libvt_avcodec_va_plugin_la_SOURCES = codec/avcodec/va_videotoolbox.c
+libvt_avcodec_va_plugin_la_CPPFLAGS = $(AM_CPPFLAGS)
+libvt_avcodec_va_plugin_la_CFLAGS = $(AM_CFLAGS) $(AVCODEC_CFLAGS)
+libvt_avcodec_va_plugin_la_LIBADD = $(AVCODEC_LIBS) libvlc_vtutils.la
+libvt_avcodec_va_plugin_la_LDFLAGS = $(AM_LDFLAGS) -Wl,-framework,VideoToolbox -Wl,-framework,CoreVideo -Wl,-framework,CoreMedia -Wl,-framework,CoreFoundation
+if HAVE_AVCODEC
+if HAVE_DARWIN
+if !HAVE_WATCHOS
+codec_PLUGINS += libvt_avcodec_va_plugin.la
+endif
+endif
+endif
+
+### avcodec hardware acceleration ###'''
+
+if marker not in content:
+    raise SystemExit('avcodec plugin section marker not found in Makefile.am — VLC source shape changed')
+
+content = content.replace(marker, vt_va_block, 1)
+
+with open(path, 'w') as f:
+    f.write(content)
+
+print('Makefile.am: libvt_avcodec_va_plugin registered')
+PYEOF
+
+    # Force regeneration of configure/Makefile.in
+    rm -f "${VLC_SRC}/configure"
+    rm -rf "${VLC_SRC}"/build-iphoneos-* \
+           "${VLC_SRC}"/build-iphonesimulator-* \
+           "${VLC_SRC}"/build-appletvos-* \
+           "${VLC_SRC}"/build-appletvsimulator-* \
+           "${VLC_SRC}"/build-xros-* \
+           "${VLC_SRC}"/build-xrsimulator-* \
+           "${VLC_SRC}"/build-macosx-* \
+           "${VLC_SRC}"/build-maccatalyst-*
+
+    info "VLC avcodec VideoToolbox VA module patched (video.c + va.c + va_videotoolbox.c + Makefile.am)"
+}
+
+patch_vlc_avcodec_vt
+
 # --- Step 2: Build tools ---
 info "Building VLC build tools..."
 export PATH="${VLC_SRC}/extras/tools/build/bin:$PATH"

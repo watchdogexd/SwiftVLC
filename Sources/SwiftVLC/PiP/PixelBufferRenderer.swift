@@ -71,6 +71,12 @@ final class PixelBufferRenderer: Sendable {
     /// stable home the runtime can track across struct copies.
     let displayLayer: DisplayLayerBox
     var timebase: CMTimebase?
+    /// Cached from `layer.sampleBufferRenderer` — that getter is @MainActor,
+    /// but the renderer object itself enqueues/flushes safely from any thread.
+    /// Caching it (populated on main when the layer is set) lets the decode
+    /// thread's enqueue path drive the renderer without touching the
+    /// main-actor getter.
+    var videoRenderer: AVSampleBufferVideoRenderer?
 
     init(displayLayer: AVSampleBufferDisplayLayer?) {
       self.displayLayer = DisplayLayerBox(displayLayer)
@@ -84,10 +90,27 @@ final class PixelBufferRenderer: Sendable {
 
   init(displayLayer: AVSampleBufferDisplayLayer) {
     state = Mutex(State(displayLayer: displayLayer))
+    cacheRenderer(from: displayLayer)
   }
 
   func setDisplayLayer(_ layer: AVSampleBufferDisplayLayer?) {
     state.withLock { $0.displayLayer.layer = layer }
+    if let layer {
+      cacheRenderer(from: layer)
+    } else {
+      state.withLock { $0.videoRenderer = nil }
+    }
+  }
+
+  /// `layer.sampleBufferRenderer` is main-actor-isolated; hop to main to read
+  /// it, then cache the (thread-safe) renderer for the decode thread to use.
+  private func cacheRenderer(from layer: AVSampleBufferDisplayLayer) {
+    DispatchQueue.main.async { [weak self] in
+      MainActor.assumeIsolated {
+        let renderer = layer.sampleBufferRenderer
+        self?.state.withLock { $0.videoRenderer = renderer }
+      }
+    }
   }
 
   func setTimebase(_ tb: CMTimebase?) {
@@ -108,10 +131,9 @@ final class PixelBufferRenderer: Sendable {
   }
 
   func flushDisplayLayer() {
-    let layer = state.withLock { $0.displayLayer.layer }
-    DispatchQueue.main.async { [layer] in
-      layer?.sampleBufferRenderer.flush()
-    }
+    // The renderer flushes safely from any thread — no main hop, no
+    // main-actor getter.
+    state.withLock { $0.videoRenderer }?.flush()
   }
 
   func outputPixelBuffer(from source: CVPixelBuffer) -> (buffer: CVPixelBuffer, generation: UInt64)? {
@@ -183,13 +205,16 @@ final class PixelBufferRenderer: Sendable {
     enqueueQueue.async { [enqueued, self] in
       guard canEnqueueFrame(generation: generation, on: enqueued.layer) else { return }
 
-      let sampleBufferRenderer = enqueued.layer.sampleBufferRenderer
-      if sampleBufferRenderer.status == .failed || sampleBufferRenderer.requiresFlushToResumeDecoding {
-        sampleBufferRenderer.flush()
+      // Use the cached renderer, not enqueued.layer.sampleBufferRenderer:
+      // that getter is @MainActor and this runs on the enqueue queue. The
+      // renderer's own enqueue/flush/status are thread-safe.
+      guard let renderer = state.withLock({ $0.videoRenderer }) else { return }
+      if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+        renderer.flush()
       }
-      guard sampleBufferRenderer.isReadyForMoreMediaData else { return }
+      guard renderer.isReadyForMoreMediaData else { return }
 
-      sampleBufferRenderer.enqueue(enqueued.sample)
+      renderer.enqueue(enqueued.sample)
     }
   }
 

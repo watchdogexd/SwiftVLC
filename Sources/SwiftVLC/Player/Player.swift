@@ -402,7 +402,12 @@ public final class Player {
   nonisolated let playbackIntentBridge: Broadcaster<Bool>
   var eventTask: Task<Void, Never>?
   var _position: Double = 0
+  @ObservationIgnored
   var _equalizer: Equalizer?
+  @ObservationIgnored
+  var _equalizerApplication: EqualizerApplication = .neverSubmitted
+  @ObservationIgnored
+  var _equalizerRevision: UInt64 = 0
   var _volume: Float = 1.0
   var _isMuted: Bool = false
   enum PauseTransition {

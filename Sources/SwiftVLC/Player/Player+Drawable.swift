@@ -94,7 +94,10 @@ extension Player {
     resumeBeforeRelease: Bool = false
   )
     throws(VLCError) {
+    guard !isShutdown else { throw .invalidState("Player is shut down") }
     let oldPointer = pointer
+    let previousEqualizerApplication = _equalizerApplication
+    let acceptedEqualizer = _equalizerApplication.lastAcceptedReceipt
     let newPointer = Self.makeNativePlayer(instance: instance)
     guard let newEventManager = libvlc_media_player_event_manager(newPointer) else {
       libvlc_media_player_release(newPointer)
@@ -122,7 +125,39 @@ extension Player {
     _ = libvlc_audio_set_delay(newPointer, audioDelay)
     _ = libvlc_video_set_spu_delay(newPointer, subtitleDelay)
     libvlc_video_set_spu_text_scale(newPointer, subtitleScale)
-    libvlc_media_player_set_equalizer(newPointer, _equalizer?.pointer)
+    let replacementEqualizer: EqualizerApplyReceipt?
+    if let acceptedEqualizer {
+      let attempt: UInt64
+      do {
+        attempt = try nextEqualizerRevision()
+      } catch {
+        libvlc_media_player_release(newPointer)
+        throw error
+      }
+      do {
+        // Preflight before the new drawable, event manager or pointer is exposed.
+        // Failed desired values and mutable legacy objects are never replayed here.
+        try Self.applyNativeEqualizer(acceptedEqualizer.snapshot, to: newPointer)
+      } catch {
+        libvlc_media_player_release(newPointer)
+        if !isShutdown, pointer == oldPointer, _equalizerRevision == attempt {
+          _equalizerApplication = .failed(attemptRevision: attempt, error: error, lastAccepted: acceptedEqualizer)
+          notifyEqualizerApplication()
+        }
+        throw error
+      }
+      guard
+        !isShutdown, pointer == oldPointer, _equalizerRevision == attempt,
+        _equalizerApplication.lastAcceptedReceipt == acceptedEqualizer else {
+        libvlc_media_player_release(newPointer)
+        throw .invalidState("Equalizer replacement no longer belongs to the current player")
+      }
+      replacementEqualizer = EqualizerApplyReceipt(revision: attempt, snapshot: acceptedEqualizer.snapshot)
+    } else {
+      // Preserve unchecked carry-over for existing mutable-property clients.
+      libvlc_media_player_set_equalizer(newPointer, _equalizer?.pointer)
+      replacementEqualizer = nil
+    }
     libvlc_media_player_set_nsobject(
       newPointer,
       target.map { Unmanaged.passUnretained($0).toOpaque() }
@@ -138,8 +173,16 @@ extension Player {
     // reattach — so reset the mirrored output count here instead of
     // leaving it pinned to the dead handle's outputs.
     endCoordinator.clearForHandleReplacement()
-    activeVideoOutputs = 0
     pointer = newPointer
+    if let replacementEqualizer {
+      // Replaying A on a new handle cannot accept a previously rejected B.
+      // Retain the failed desired attempt while rebasing its accepted effect.
+      if case .failed(let attempt, let error, _) = previousEqualizerApplication {
+        _equalizerApplication = .failed(attemptRevision: attempt, error: error, lastAccepted: replacementEqualizer)
+      } else {
+        _equalizerApplication = .accepted(replacementEqualizer)
+      }
+    }
     attachedMediaListPlayer?.rebindMediaPlayerHandle()
     applyAspectRatio()
 
@@ -154,6 +197,10 @@ extension Player {
       retaining: retainedDrawables,
       resumeBeforeStop: resumeBeforeRelease
     )
+    // Publish after handle and EQ receipt adoption so a synchronous observer
+    // applies its next EQ request to the new current handle, not the outgoing one.
+    activeVideoOutputs = 0
     notifyMediaDependentObservables()
+    if replacementEqualizer != nil { notifyEqualizerApplication() }
   }
 }

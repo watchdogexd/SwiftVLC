@@ -97,6 +97,11 @@ extension Player {
   public func shutdown() async {
     guard !isShutdown else { return }
     isShutdown = true
+    _equalizer?.onChange = nil
+    _equalizer = nil
+    _equalizerApplication = .retired
+    notifyEqualizerAttachment()
+    notifyEqualizerApplication()
     // A still-attached list player would keep driving the handle being
     // torn down (its native binding retains it past the release) —
     // detach through the public setter so suppression and the native

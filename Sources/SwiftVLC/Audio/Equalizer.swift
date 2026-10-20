@@ -1,6 +1,64 @@
 import CLibVLC
 import Observation
 
+/// Complete immutable native equalizer settings, in dB.
+///
+/// Values are validated without clamping. The receiving player additionally
+/// checks the band count against the linked libVLC before touching its output.
+/// This value contains no native handle or mutable attachment.
+public struct EqualizerSnapshot: Sendable, Equatable {
+  public let preamp: Float
+  public let bands: [Float]
+
+  public init(preamp: Float, bands: [Float]) throws(VLCError) {
+    guard preamp.isFinite, (-20...20).contains(preamp) else {
+      throw .invalidInput("preamp must be finite and in -20...20 dB")
+    }
+    guard bands.allSatisfy({ $0.isFinite && (-20...20).contains($0) }) else {
+      throw .invalidInput("bands must contain only finite values in -20...20 dB")
+    }
+    self.preamp = preamp
+    self.bands = bands
+  }
+}
+
+/// A checked native settings request accepted by one player incarnation.
+///
+/// Acceptance does not prove that an audio filter loaded or that its output
+/// was audible. Replacement issues a new receipt even for identical settings.
+public struct EqualizerApplyReceipt: Sendable, Equatable {
+  public enum Mode: Sendable, Equatable {
+    case bypassed
+    case configured
+  }
+
+  /// Unique within this Player's lifetime; never wraps or resets on media stop.
+  public let revision: UInt64
+  /// Copied accepted settings. `nil` means a checked bypass request.
+  public let snapshot: EqualizerSnapshot?
+  public var mode: Mode { snapshot == nil ? .bypassed : .configured }
+}
+
+/// The current checked application result, separate from playback state.
+public enum EqualizerApplication: Sendable, Equatable {
+  case neverSubmitted
+  /// The compatible mutable property was used; its native result is unchecked.
+  case legacyUnverified
+  case accepted(EqualizerApplyReceipt)
+  case failed(attemptRevision: UInt64, error: VLCError, lastAccepted: EqualizerApplyReceipt?)
+  case retired
+
+  /// The last accepted request still belonging to this player's current handle.
+  /// A failed attempt does not overwrite that request or certify native output.
+  public var lastAcceptedReceipt: EqualizerApplyReceipt? {
+    switch self {
+    case .accepted(let receipt): receipt
+    case .failed(_, _, let receipt): receipt
+    case .neverSubmitted, .legacyUnverified, .retired: nil
+    }
+  }
+}
+
 /// A 10-band audio equalizer with preamp and preset support.
 ///
 /// `Equalizer` is `@Observable` and `@MainActor`. SwiftUI views that
@@ -32,6 +90,31 @@ public final class Equalizer {
       preconditionFailure("Failed to allocate libvlc equalizer. Out of memory?")
     }
     pointer = p
+  }
+
+  /// Stages a complete checked snapshot without exposing a partially set handle.
+  /// Used by explicit application and native-player replacement alike.
+  init(snapshot: EqualizerSnapshot) throws(VLCError) {
+    guard snapshot.bands.count == Self.bandCount else {
+      throw .invalidInput("bands.count must equal Equalizer.bandCount (\(Self.bandCount))")
+    }
+    guard let p = libvlc_audio_equalizer_new() else {
+      throw .operationFailed("Allocate equalizer")
+    }
+    var prepared = false
+    defer {
+      if !prepared { libvlc_audio_equalizer_release(p) }
+    }
+    guard libvlc_audio_equalizer_set_preamp(p, snapshot.preamp) == 0 else {
+      throw .operationFailed("Set equalizer preamp")
+    }
+    for (index, gain) in snapshot.bands.enumerated() {
+      guard libvlc_audio_equalizer_set_amp_at_index(p, gain, UInt32(index)) == 0 else {
+        throw .operationFailed("Set equalizer amplification for band \(index)")
+      }
+    }
+    pointer = p
+    prepared = true
   }
 
   /// Creates an equalizer from a preset.

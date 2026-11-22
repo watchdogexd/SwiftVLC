@@ -90,25 +90,32 @@ final class PixelBufferRenderer: Sendable {
 
   init(displayLayer: AVSampleBufferDisplayLayer) {
     state = Mutex(State(displayLayer: displayLayer))
-    cacheRenderer(from: displayLayer)
+    refreshCachedRenderer()
   }
 
   func setDisplayLayer(_ layer: AVSampleBufferDisplayLayer?) {
-    state.withLock { $0.displayLayer.layer = layer }
-    if let layer {
-      cacheRenderer(from: layer)
-    } else {
-      state.withLock { $0.videoRenderer = nil }
+    state.withLock {
+      $0.displayLayer.layer = layer
+      $0.videoRenderer = nil
+    }
+    if layer != nil {
+      refreshCachedRenderer()
     }
   }
 
   /// `layer.sampleBufferRenderer` is main-actor-isolated; hop to main to read
-  /// it, then cache the (thread-safe) renderer for the decode thread to use.
-  private func cacheRenderer(from layer: AVSampleBufferDisplayLayer) {
+  /// it from the currently bound layer, then cache the (thread-safe) renderer
+  /// for the decode thread to use.
+  private func refreshCachedRenderer() {
     DispatchQueue.main.async { [weak self] in
       MainActor.assumeIsolated {
-        let renderer = layer.sampleBufferRenderer
-        self?.state.withLock { $0.videoRenderer = renderer }
+        guard let self else { return }
+        let currentLayer = self.state.withLock { $0.displayLayer.layer }
+        let renderer = currentLayer?.sampleBufferRenderer
+        self.state.withLock { state in
+          guard state.displayLayer.layer === currentLayer else { return }
+          state.videoRenderer = renderer
+        }
       }
     }
   }
